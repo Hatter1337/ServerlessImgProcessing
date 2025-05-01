@@ -1,0 +1,23 @@
+version = 0.1
+
+# Run local API:
+#   - $ sam build
+#   - $ sam local start-api --port 8000 --profile hatter
+[default.local_start_api.parameters]
+region = "us-west-1"
+warm_containers = "EAGER"
+parameter_overrides = [
+    "Env=dev"
+]
+
+# Deploy to Development environment:
+#   - $ sam build
+#   - $ sam deploy --config-env dev --profile hatter
+[dev.deploy.parameters]
+stack_name = "sip-app-dev"
+region = "us-west-1"
+s3_bucket = "sam-deploy-{YourAWSAccountId}-us-west-1-dev" # TODO: Your S3 Bucket for SAM deployments, create with src/resources/s3.yaml
+capabilities = "CAPABILITY_IAM CAPABILITY_AUTO_EXPAND CAPABILITY_NAMED_IAM"
+parameter_overrides = [
+    "Env=dev"
+]

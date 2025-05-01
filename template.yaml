@@ -1,0 +1,203 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  SAM Template for Serverless Image Processing App
+
+Parameters:
+  Env:
+    Description: Deploying environment
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - prod
+
+Conditions:
+  IsProductionEnvCondition: !Equals [!Ref Env, "prod"]
+
+Mappings:
+  EnvSettings:
+    dev:
+      LogRetentionInDays: 14 # 2 weeks
+    prod:
+      LogRetentionInDays: 90 # 3 months
+
+Globals:
+  Function:
+    Runtime: python3.13
+    MemorySize: 128
+    Timeout: 15
+    Architectures:
+      - x86_64
+    Environment:
+      Variables:
+        ENVIRONMENT: !Ref Env
+        REGION: !Sub ${AWS::Region}
+
+Resources:
+  # --------------------------------------------------------------------------------- S3 Bucket(s)
+  MediaBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref MediaBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: PublicReadGetObject
+            Effect: Allow
+            Principal: "*"
+            Action:
+              - "s3:GetObject"
+            Resource:
+              - !Sub "arn:aws:s3:::${MediaBucket}/*"
+
+  MediaBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "hatter-media-storage-${Env}"  # Bucket name must be globally unique
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins:
+              - "*"
+            AllowedMethods:
+              - "GET"
+              - "PUT"
+              - "POST"
+              - "DELETE"
+              - "HEAD"
+            AllowedHeaders:
+              - "*"
+
+  # --------------------------------------------------------------------------------- SQS Queues
+  ImageProcessingDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "serverless-image-processing-dlq-${Env}.fifo"
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      MessageRetentionPeriod: 1209600 # (14 days) Time messages are kept in queue before deletion
+
+  ImageProcessingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "serverless-image-processing-queue-${Env}.fifo"
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      MessageRetentionPeriod: 86400 # (24 hours) Time messages are kept in queue before deletion
+      VisibilityTimeout: 60 # (60 seconds) Time message is invisible in the queue after retrieval
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ImageProcessingDLQ.Arn
+        maxReceiveCount: 3 # Number of retries before moving a message to DLQueue
+
+  # --------------------------------------------------------------------------------- Lambda Layers
+  AWSUtilsLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: aws-utils-layer
+      Description: "Lambda Layer for AWS utilities"
+      ContentUri: src/layers/aws_utils_layer/  # boto3 already included in Lambda runtime
+      CompatibleRuntimes:
+        - python3.13
+      RetentionPolicy: Retain
+    Metadata:
+      BuildMethod: python3.13
+
+  ImgProcessingAPILayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: toon-me-layer
+      Description: "Lambda Layer for Image Processing API client"
+      ContentUri: src/layers/img_proc_api_layer/
+      CompatibleRuntimes:
+        - python3.13
+      RetentionPolicy: Retain
+    Metadata:
+      BuildMethod: python3.13
+
+  # -------------------------------------------------------------------------------- Lambda Role(s)
+  BaseLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "sip-base-lambda-execution-role-${Env}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AllowSIPS3Access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub "${MediaBucket.Arn}/*"
+        - PolicyName: AllowSIPSQSPolling
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:Get*
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                Resource:
+                  - !GetAtt ImageProcessingQueue.Arn
+                  - !GetAtt ImageProcessingDLQ.Arn
+        - PolicyName: AllowSIPDynamoDBAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/serverless-image-processing-cache-tbl-${Env}"
+
+  # --------------------------------------------------------------- Lambda functions
+  ImageProcessingFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "image-processing-fn-${Env}"
+      CodeUri: src/lambda/functions/image_processing/
+      Handler: app.lambda_handler
+      Role: !GetAtt BaseLambdaExecutionRole.Arn
+      Timeout: 60
+      Events:
+        SQSBatchEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ImageProcessingQueue.Arn
+            Enabled: true
+            BatchSize: 10
+
+  ImageProcessingFunctionLogGroup: # It's required to have log group with limited retention period
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/image-processing-fn-${Env}"
+      RetentionInDays: !FindInMap [EnvSettings, !Ref Env, LogRetentionInDays]
+
+Outputs:
+  AWSUtilsLayerOutput:
+    Description: "ARN for Lambda Layer for AWS utilities"
+    Value: !Ref AWSUtilsLayer
+
+  ImgProcessingAPILayerOutput:
+    Description: "ARN for Lambda Layer with Image Processing API client"
+    Value: !Ref ImgProcessingAPILayer
